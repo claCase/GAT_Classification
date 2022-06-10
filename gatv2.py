@@ -116,7 +116,7 @@ class GATModel(m.Model):
         assert len(channels) == len(heads) == len(hidden_sizes)
         self.n_layers = len(hidden_sizes)
         self.activation = activation
-        self.gat_layers = [GATConv(attn_heads=hh, channels=c, activation=activation, *args) for c, hh in
+        self.gat_layers = [GATConv(attn_heads=hh, channels=c, activation=activation, dropout_rate=0, *args) for c, hh in
                            zip(self.channels, self.heads)]
         self.dense_layers = [l.Dense(h, activation) for h in self.hidden_sizes]
 
