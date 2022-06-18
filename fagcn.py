@@ -30,22 +30,24 @@ class FAGCNLayer(l.Layer):
 
     def call(self, inputs, *args, **kwargs):
         x, a = inputs
-        N = tf.shape(x, out_type=a.indices.dtype)[-2]
-        diag = sparse_diag(a)
-        sqrt_diag = tf.math.sqrt(diag.values)[:, None]  # Nx1
-        i, j = a.indices[:, 0], a.indices[:, 1]
-        x_i = tf.gather(x, i)  # ExF
-        x_j = tf.gather(x, j)  # ExF
-        x_ij = tf.concat([x_i, x_j], -1)  # Ex2F
-        alpha = tf.nn.tanh(x_ij @ self.kernel)  # Ex1
-        di = tf.gather(sqrt_diag, i)  # Ex1
-        dj = tf.gather(sqrt_diag, j)  # Ex1
-        dij = tf.where(di * dj == 0.0, k.epsilon(), di * dj)  # Ex1
-        g_coeff = alpha / dij  # Ex1
-        g_coeff = self.dropout(g_coeff)
-        x_i_weighted = x_i * g_coeff  # ExF
-        x_i_summed = tf.math.unsorted_segment_sum(x_i_weighted, j, N)  # NxF
-        #x_j_prime = self.epsilon * x + x_i_summed  # NxF
+        if isinstance(a, tf.sparse.SparseTensor):
+            tf.assert_rank(a, 2)
+            N = tf.shape(x, out_type=a.indices.dtype)[-2]
+            diag = sparse_diag(a)
+            sqrt_diag = tf.math.sqrt(diag.values)[:, None]  # Nx1
+            i, j = a.indices[:, 0], a.indices[:, 1]
+            x_i = tf.gather(x, i)  # ExF
+            x_j = tf.gather(x, j)  # ExF
+            x_ij = tf.concat([x_i, x_j], -1)  # Ex2F
+            alpha = tf.nn.tanh(x_ij @ self.kernel)  # Ex1
+            di = tf.gather(sqrt_diag, i)  # Ex1
+            dj = tf.gather(sqrt_diag, j)  # Ex1
+            dij = tf.where(di * dj == 0.0, k.epsilon(), di * dj)  # Ex1
+            g_coeff = alpha / dij  # Ex1
+            g_coeff = self.dropout(g_coeff)
+            x_i_weighted = x_i * g_coeff  # ExF
+            x_i_summed = tf.math.unsorted_segment_sum(x_i_weighted, j, N)  # NxF
+            #x_j_prime = self.epsilon * x + x_i_summed  # NxF
         return x_i_summed
 
 
