@@ -26,8 +26,9 @@ class TDistributionKernel(l.Layer):
 
     def call(self, inputs, *args, **kwargs):
         '''
-        Comutes Density of student T Distribution
-        :param inputs: Tuple [Z,U] where Z is of shape BxNxF and U is of shape BxCxF, where C is the number of clusters
+        Computes Density of student T Distribution
+        :param inputs: Tuple [Z,U] where Z (predicted clusters) is of shape BxNxF and U (true clusters) is of shape
+                       BxCxF, where C is the number of clusters
         :param args:
         :param kwargs:
         :return: Tensor of Shape BxNxC
@@ -35,7 +36,7 @@ class TDistributionKernel(l.Layer):
         Z, U = inputs
         diff = Z[..., None, :] - U[..., None, :, :]  # BxNxN
         norm = tf.norm(diff, axis=-1)  # BxN
-        numerator = (1 + norm / self.dof) ** ((-self.dof + 1) / 2)
+        numerator = (1 + norm / self.dof) ** (-(self.dof + 1) / 2)
         denominator = tf.reduce_sum(numerator, axis=-1)
         qij = numerator / denominator[..., None]
         return qij
@@ -73,14 +74,11 @@ class DeepAutoencoderBlock(m.Model):
         self.hidden_reconstruction_loss = hidden_reconstruction_loss
         self.n_encoder_layers = len(encoder.layers)
         self.n_decoder_layers = len(decoder.layers)
-        print(self.n_encoder_layers, self.n_decoder_layers)
         assert self.n_encoder_layers + 2 == self.n_decoder_layers
         # Assumption: Dropout every other layer
         # TODO: get only dropout layer output
-        self.range_decoder_layers = tf.range(0, self.n_encoder_layers-2, delta=2)
-        #print(self.range_encoder_layers)
-        self.reverse_range_encoder_layers = tf.reverse(self.range_decoder_layers, axis=[0])
-        #print(self.reverse_range_encoder_layers)
+        self.range_encoder_layers = tf.range(0, self.n_encoder_layers, delta=2)
+        self.reverse_range_decoder_layers = tf.reverse(self.range_encoder_layers, axis=[0])
 
     '''def build(self, input_shape):
         for i, j in zip(self.range_encoder_layers, self.reverse_range_decoder_layers):
@@ -95,17 +93,12 @@ class DeepAutoencoderBlock(m.Model):
         dropped_encoder_out = self.dropout2(encoder_out)
         decoder_out = self.decoder(dropped_encoder_out)
         # reverse layer-wise reconstruction loss
-        counter = 0
-        for j, i in zip(self.range_decoder_layers, self.reverse_range_encoder_layers):
-            print(counter)
-            counter += 1
-            print(i, j)
-            # print(f"{self.encoder.layers[i].name, self.decoder.layers[j].name}")
+        for i, j in zip(self.range_encoder_layers, self.reverse_range_decoder_layers):
             self.add_loss(loss.get(self.hidden_reconstruction_loss)(self.encoder.layers[i].output,
                                                                     self.decoder.layers[j].output)
                           )
         # input-output reconstruction loss
-        self.add_loss(loss.get(self.hidden_reconstruction_loss)(inputs, decoder_out))
+        self.add_loss(loss.get(self.hidden_reconstruction_loss)(dropped_inputs, decoder_out))
         return decoder_out
 
 
@@ -123,13 +116,13 @@ class Dense3D(l.Layer):
         return self.activation(out)
 
 
-def training_loop_clustering(inputs, encoder_model: m.Model, optimizer: optim.Optimizer, epochs=100):
+def training_loop_clustering(inputs, true_clusters, encoder_model: m.Model, optimizer: optim.Optimizer, epochs=100):
     pdk = TDistributionKernel()  # Probability based on Distance Kernel
     fca = FrequencyClusterAssignment()  # Frequency Cluster Assignment
     for i in range(epochs):
         with tf.GradientTape() as tape:
             pred_clusters = encoder_model(inputs)
-            q = pdk(pred_clusters)
+            q = pdk([pred_clusters, true_clusters])
             p = fca(q)
             loss = KL(p, q)
             print(f"Clustering Encoder Training | Epoch: {i} | Loss: {tf.reduce_sum(loss)}")
@@ -151,24 +144,28 @@ def training_loop_autoencoder(inputs, autoencoder_model: DeepAutoencoderBlock,
 
 
 def full_training_loop(inputs,
+                       n_clusters: int,
                        autoencoder_model: DeepAutoencoderBlock,
                        optimizer: str = "Adam",
-                       epochs_autoencoder=50,
-                       epochs_clustering=50):
+                       epochs_autoencoder=150,
+                       epochs_clustering=150,
+                       clustering_iterations=5):
     autoencoder_optimizer = optim.get(optimizer)
     clustering_encoder_optimizer = optim.get(optimizer)
     # Pre-train Autoencoder model
-    autoencoder_model, loss_hist = training_loop_autoencoder(inputs, autoencoder_model=autoencoder_model,
-                                                             optimizer=autoencoder_optimizer,
-                                                             epochs=epochs_autoencoder)
+    print("Pre-train Autoencoder")
+    autoencoder_model = training_loop_autoencoder(inputs, autoencoder_model=autoencoder_model,
+                                                  optimizer=autoencoder_optimizer,
+                                                  epochs=epochs_autoencoder)
     # Get Encoder model and discard decoder
+    print("Get Encoder")
     encoder_model = autoencoder_model.encoder
     clusters_position = "k-means++"
-    for i in range(epochs_clustering):
+    for i in range(clustering_iterations):
         encoder_output = encoder_model(inputs)
         encoder_output = tf.reshape(encoder_output, (-1, encoder_output.shape[-1]))
         encoder_output_no_batch = tf.reshape(encoder_output, (-1, encoder_output.shape[-1])).numpy()
-        trained_km = KMeans(n_clusters=encoder_output.shape[-1],
+        trained_km = KMeans(n_clusters=n_clusters,
                             init=clusters_position,
                             n_init=15,
                             max_iter=250).fit(encoder_output_no_batch)
@@ -212,29 +209,36 @@ if __name__ == '__main__':
     hidden_sizes_decoder.extend([input_size])
     deep_net_encoder = m.Sequential()
     for i, h in enumerate(hidden_sizes_encoder):
-        if i == len(hidden_sizes_encoder):
+        if i == len(hidden_sizes_encoder) - 1:
             deep_net_encoder.add(Dense3D(h, activation="elu"))
         else:
-            deep_net_encoder.add(Dense3D(h, activation=None))
+            deep_net_encoder.add(Dense3D(h, activation='elu'))
         deep_net_encoder.add(l.Dropout(0.2))
     deep_net_decoder = m.Sequential()
     for i, h in enumerate(hidden_sizes_decoder):
-        if i == len(hidden_sizes_decoder):
+        if i == len(hidden_sizes_decoder) - 1:
             deep_net_decoder.add(Dense3D(h, activation=None))
         else:
             deep_net_decoder.add(Dense3D(h, activation="elu"))
         deep_net_decoder.add(l.Dropout(0.2))
     autoencoder = DeepAutoencoderBlock(deep_net_encoder, deep_net_decoder)
-    trained_encoder = full_training_loop(x_train, autoencoder)
+    trained_encoder = full_training_loop(inputs=x_train, n_clusters=7, autoencoder_model=autoencoder,
+                                         epochs_autoencoder=250, epochs_clustering=5, clustering_iterations=100)
     centroid_output_trained_training_set = trained_encoder(x_train).numpy().reshape(-1, 3)
     centroid_output_trained_test_set = trained_encoder(x_test).numpy().reshape(-1, 3)
-    y_lab_idx_train = np.argmax(y[y_train], -1)
-    y_lab_idx_test = np.argmax(y[y_test], -1)
-    plt.figure()
-    ax = plt.add_subplot(projection='3d')
+    y_lab_idx_train = np.argmax(y[idx_train], -1)
+    print(y_lab_idx_train)
+    y_lab_idx_test = np.argmax(y[idx_test], -1)
+    fig = plt.figure()
+    ax = fig.add_subplot(projection='3d')
     ax.set_title("Training Set")
-    ax.scatter(centroid_output_trained_training_set, cmap(y_lab_idx_train))
-    ax = plt.add_subplot(projection='3d')
-    ax.set_title("Test Set")
-    ax.scatter(centroid_output_trained_test_set, cmap(y_lab_idx_test))
+    ax.scatter(centroid_output_trained_training_set[:, 0],
+               centroid_output_trained_training_set[:, 1],
+               centroid_output_trained_training_set[:, 2], c=cmap(y_lab_idx_train * 2))
+    fig2 = plt.figure()
+    ax2 = fig2.add_subplot(projection='3d')
+    ax2.set_title("Test Set")
+    ax2.scatter(centroid_output_trained_test_set[:, 0],
+                centroid_output_trained_test_set[:, 1],
+                centroid_output_trained_test_set[:, 2], c=cmap(y_lab_idx_test * 2))
     plt.show()
